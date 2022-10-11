@@ -5,6 +5,33 @@
 #include "shm_tools.h"
 #include "xdg-shell-client-protocol.h"
 
+/// --------- pointer events
+
+enum pointer_event_mask {
+    POINTER_EVENT_ENTER = 1 << 0,
+    POINTER_EVENT_LEAVE = 1 << 1,
+    POINTER_EVENT_MOTION = 1 << 2,
+    POINTER_EVENT_BUTTON = 1 << 3,
+    POINTER_EVENT_AXIS = 1 << 4,
+    POINTER_EVENT_AXIS_SOURCE = 1 << 5,
+    POINTER_EVENT_AXIS_STOP = 1 << 6,
+    POINTER_EVENT_AXIS_DISCRETE = 1 << 7,
+};
+
+struct pointer_event {
+    uint32_t event_mask;
+    wl_fixed_t surface_x, surface_y;
+    uint32_t button, state;
+    uint32_t time;
+    uint32_t serial;
+    struct {
+        bool valid;
+        wl_fixed_t value;
+        int32_t discrete;
+    } axes[2];
+    uint32_t axis_source;
+};
+
 /// --------- client state
 
 struct client_state {
@@ -14,13 +41,20 @@ struct client_state {
     struct wl_shm *wl_shm;
     struct wl_compositor *wl_compositor;
     struct xdg_wm_base *xdg_wm_base;
+    struct wl_seat *wl_seat;
     /* Objects */
     struct wl_surface *wl_surface;
     struct xdg_surface *xdg_surface;
     struct xdg_toplevel *xdg_toplevel;
+    struct wl_keyboard *wl_keyboard;
+    struct wl_pointer *wl_pointer;
+    struct wl_touch *wl_touch;
     /* State */
     float offset;
     uint32_t last_frame;
+    int width, height;
+    bool closed;
+    struct pointer_event pointer_event;
 };
 
 /// --------- wl registry listener
@@ -44,6 +78,9 @@ registry_handle_global(void *data, struct wl_registry *wl_registry,
     if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
         state->xdg_wm_base = static_cast<xdg_wm_base *>(wl_registry_bind(
                 wl_registry, name, &xdg_wm_base_interface, 1));
+    } else if (strcmp(interface, wl_seat_interface.name) == 0) {
+        state->wl_seat = static_cast<wl_seat *>(wl_registry_bind(
+                wl_registry, name, &wl_seat_interface, 5));
     }
 }
 
@@ -169,6 +206,196 @@ wl_surface_frame_done(void *data, struct wl_callback *cb, uint32_t time)
 };
 
 
+/// --------- wl pointer listener
+
+static void
+wl_pointer_enter(void *data, struct wl_pointer *wl_pointer,
+                 uint32_t serial, struct wl_surface *surface,
+                 wl_fixed_t surface_x, wl_fixed_t surface_y) {
+    struct client_state *client_state = static_cast<struct client_state *>(data);
+    client_state->pointer_event.event_mask |= POINTER_EVENT_ENTER;
+    client_state->pointer_event.serial = serial;
+    client_state->pointer_event.surface_x = surface_x,
+            client_state->pointer_event.surface_y = surface_y;
+}
+
+static void
+wl_pointer_leave(void *data, struct wl_pointer *wl_pointer,
+                 uint32_t serial, struct wl_surface *surface) {
+    struct client_state *client_state = static_cast<struct client_state *>(data);
+    client_state->pointer_event.serial = serial;
+    client_state->pointer_event.event_mask |= POINTER_EVENT_LEAVE;
+}
+
+static void
+wl_pointer_motion(void *data, struct wl_pointer *wl_pointer, uint32_t time,
+                  wl_fixed_t surface_x, wl_fixed_t surface_y) {
+    struct client_state *client_state = static_cast<struct client_state *>(data);
+    client_state->pointer_event.event_mask |= POINTER_EVENT_MOTION;
+    client_state->pointer_event.time = time;
+    client_state->pointer_event.surface_x = surface_x,
+            client_state->pointer_event.surface_y = surface_y;
+}
+
+static void
+wl_pointer_button(void *data, struct wl_pointer *wl_pointer, uint32_t serial,
+                  uint32_t time, uint32_t button, uint32_t state) {
+    struct client_state *client_state = static_cast<struct client_state *>(data);
+    client_state->pointer_event.event_mask |= POINTER_EVENT_BUTTON;
+    client_state->pointer_event.time = time;
+    client_state->pointer_event.serial = serial;
+    client_state->pointer_event.button = button,
+            client_state->pointer_event.state = state;
+}
+
+static void
+wl_pointer_axis(void *data, struct wl_pointer *wl_pointer, uint32_t time,
+                uint32_t axis, wl_fixed_t value) {
+    struct client_state *client_state = static_cast<struct client_state *>(data);
+    client_state->pointer_event.event_mask |= POINTER_EVENT_AXIS;
+    client_state->pointer_event.time = time;
+    client_state->pointer_event.axes[axis].valid = true;
+    client_state->pointer_event.axes[axis].value = value;
+}
+
+static void
+wl_pointer_axis_source(void *data, struct wl_pointer *wl_pointer,
+                       uint32_t axis_source) {
+    struct client_state *client_state = static_cast<struct client_state *>(data);
+    client_state->pointer_event.event_mask |= POINTER_EVENT_AXIS_SOURCE;
+    client_state->pointer_event.axis_source = axis_source;
+}
+
+static void
+wl_pointer_axis_stop(void *data, struct wl_pointer *wl_pointer,
+                     uint32_t time, uint32_t axis) {
+    struct client_state *client_state = static_cast<struct client_state *>(data);
+    client_state->pointer_event.time = time;
+    client_state->pointer_event.event_mask |= POINTER_EVENT_AXIS_STOP;
+    client_state->pointer_event.axes[axis].valid = true;
+}
+
+static void
+wl_pointer_axis_discrete(void *data, struct wl_pointer *wl_pointer,
+                         uint32_t axis, int32_t discrete) {
+    struct client_state *client_state = static_cast<struct client_state *>(data);
+    client_state->pointer_event.event_mask |= POINTER_EVENT_AXIS_DISCRETE;
+    client_state->pointer_event.axes[axis].valid = true;
+    client_state->pointer_event.axes[axis].discrete = discrete;
+}
+
+static void
+wl_pointer_frame(void *data, struct wl_pointer *wl_pointer) {
+    struct client_state *client_state = static_cast<struct client_state *>(data);
+    struct pointer_event *event = &client_state->pointer_event;
+    fprintf(stdout, "pointer frame @ %d: ", event->time);
+
+    if (event->event_mask & POINTER_EVENT_ENTER) {
+        fprintf(stdout, "entered %f, %f ",
+                wl_fixed_to_double(event->surface_x),
+                wl_fixed_to_double(event->surface_y));
+    }
+
+    if (event->event_mask & POINTER_EVENT_LEAVE) {
+        fprintf(stdout, "leave");
+    }
+
+    if (event->event_mask & POINTER_EVENT_MOTION) {
+        fprintf(stdout, "motion %f, %f ",
+                wl_fixed_to_double(event->surface_x),
+                wl_fixed_to_double(event->surface_y));
+    }
+
+    if (event->event_mask & POINTER_EVENT_BUTTON) {
+        char *state = const_cast<char *>(event->state == WL_POINTER_BUTTON_STATE_RELEASED ?
+                                         "released" : "pressed");
+        fprintf(stdout, "button %d %s ", event->button, state);
+    }
+
+    uint32_t axis_events = POINTER_EVENT_AXIS
+                           | POINTER_EVENT_AXIS_SOURCE
+                           | POINTER_EVENT_AXIS_STOP
+                           | POINTER_EVENT_AXIS_DISCRETE;
+    char *axis_name[2] = {
+            [WL_POINTER_AXIS_VERTICAL_SCROLL] = "vertical",
+            [WL_POINTER_AXIS_HORIZONTAL_SCROLL] = "horizontal",
+    };
+    char *axis_source[4] = {
+            [WL_POINTER_AXIS_SOURCE_WHEEL] = "wheel",
+            [WL_POINTER_AXIS_SOURCE_FINGER] = "finger",
+            [WL_POINTER_AXIS_SOURCE_CONTINUOUS] = "continuous",
+            [WL_POINTER_AXIS_SOURCE_WHEEL_TILT] = "wheel tilt",
+    };
+    if (event->event_mask & axis_events) {
+        for (size_t i = 0; i < 2; ++i) {
+            if (!event->axes[i].valid) {
+                continue;
+            }
+            fprintf(stdout, "%s axis ", axis_name[i]);
+            if (event->event_mask & POINTER_EVENT_AXIS) {
+                fprintf(stdout, "value %f ", wl_fixed_to_double(
+                        event->axes[i].value));
+            }
+            if (event->event_mask & POINTER_EVENT_AXIS_DISCRETE) {
+                fprintf(stdout, "discrete %d ",
+                        event->axes[i].discrete);
+            }
+            if (event->event_mask & POINTER_EVENT_AXIS_SOURCE) {
+                fprintf(stdout, "via %s ",
+                        axis_source[event->axis_source]);
+            }
+            if (event->event_mask & POINTER_EVENT_AXIS_STOP) {
+                fprintf(stdout, "(stopped) ");
+            }
+        }
+    }
+
+    fprintf(stdout, "\n");
+    memset(event, 0, sizeof(*event));
+}
+
+static const struct wl_pointer_listener wl_pointer_listener = {
+        .enter = wl_pointer_enter,
+        .leave = wl_pointer_leave,
+        .motion = wl_pointer_motion,
+        .button = wl_pointer_button,
+        .axis = wl_pointer_axis,
+        .frame = wl_pointer_frame,
+        .axis_source = wl_pointer_axis_source,
+        .axis_stop = wl_pointer_axis_stop,
+        .axis_discrete = wl_pointer_axis_discrete,
+};
+
+/// --------- wl seat listener
+
+static void
+wl_seat_capabilities(void *data, struct wl_seat *wl_seat, uint32_t capabilities) {
+    struct client_state *state = static_cast<client_state *>(data);
+
+    bool have_pointer = capabilities & WL_SEAT_CAPABILITY_POINTER;
+
+    if (have_pointer && state->wl_pointer == NULL) {
+        state->wl_pointer = wl_seat_get_pointer(state->wl_seat);
+        wl_pointer_add_listener(state->wl_pointer,
+                                &wl_pointer_listener, state);
+    } else if (!have_pointer && state->wl_pointer != NULL) {
+        wl_pointer_release(state->wl_pointer);
+        state->wl_pointer = NULL;
+    }
+}
+
+static void
+wl_seat_name(void *data, struct wl_seat *wl_seat, const char *name) {
+    fprintf(stdout, "seat name: %s\n", name);
+}
+
+static const struct wl_seat_listener wl_seat_listener = {
+        .capabilities = wl_seat_capabilities,
+        .name = wl_seat_name,
+};
+
+
+
 /// --------- main
 
 int
@@ -183,47 +410,10 @@ main(int argc, char *argv[])
 //    wl_shm_add_listener(registry, &registry_listener, &state);
     wl_display_roundtrip(state.wl_display);
 
+    wl_seat_add_listener(state.wl_seat, &wl_seat_listener, &state);
+
     /// create surface
     state.wl_surface = wl_compositor_create_surface(state.wl_compositor);
-//
-//    /// create mem pool
-//    const int width = 1920, height = 1080;
-//    const int stride = width * 4;
-//    const int shm_pool_size = height * stride * 2;
-//
-//    int fd = allocate_shm_file(shm_pool_size);
-//    uint8_t *pool_data = static_cast<uint8_t *>(mmap(NULL, shm_pool_size,
-//                                                     PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
-//
-//    struct wl_shm *shm = state.wl_shm; // Bound from registry
-//    struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, shm_pool_size);
-//
-//    /// create buffer from pool
-//    int index = 0;
-//    int offset = height * stride * index;
-//    struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, offset,
-//                                                         width, height, stride, WL_SHM_FORMAT_XRGB8888);
-//
-//    /// set memdata to something
-//    uint32_t *pixels = (uint32_t *)&pool_data[offset];
-//    memset(pixels, 0, width * height * 4);
-//
-//    /// checker perhaps
-////    uint32_t *pixels = (uint32_t *)&pool_data[offset];
-//    for (int y = 0; y < height; ++y) {
-//        for (int x = 0; x < width; ++x) {
-//            if ((x + y / 8 * 8) % 16 < 8) {
-//                pixels[y * width + x] = 0xFF666666;
-//            } else {
-//                pixels[y * width + x] = 0xFFEEEEEE;
-//            }
-//        }
-//    }
-//
-//    /// attach buffer to surface
-//    wl_surface_attach(state.wl_surface, buffer, 0, 0);
-//    wl_surface_damage(state.wl_surface, 0, 0, UINT32_MAX, UINT32_MAX);
-//    wl_surface_commit(state.wl_surface);
 
     /// get xdg_surface
     state.xdg_surface = xdg_wm_base_get_xdg_surface(
@@ -238,6 +428,9 @@ main(int argc, char *argv[])
 
     struct wl_callback *cb = wl_surface_frame(state.wl_surface);
     wl_callback_add_listener(cb, &wl_surface_frame_listener, &state);
+
+
+
 
     /// dispatch loop
     while (wl_display_dispatch(state.wl_display)) {
