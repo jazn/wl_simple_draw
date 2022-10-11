@@ -7,6 +7,33 @@
 #include "shm_tools.h"
 #include "xdg-shell-client-protocol.h"
 
+/// --------- touch events
+
+enum touch_event_mask {
+    TOUCH_EVENT_DOWN = 1 << 0,
+    TOUCH_EVENT_UP = 1 << 1,
+    TOUCH_EVENT_MOTION = 1 << 2,
+    TOUCH_EVENT_CANCEL = 1 << 3,
+    TOUCH_EVENT_SHAPE = 1 << 4,
+    TOUCH_EVENT_ORIENTATION = 1 << 5,
+};
+
+struct touch_point {
+    bool valid;
+    int32_t id;
+    uint32_t event_mask;
+    wl_fixed_t surface_x, surface_y;
+    wl_fixed_t major, minor;
+    wl_fixed_t orientation;
+};
+
+struct touch_event {
+    uint32_t event_mask;
+    uint32_t time;
+    uint32_t serial;
+    struct touch_point points[10];
+};
+
 /// --------- pointer events
 
 enum pointer_event_mask {
@@ -60,6 +87,7 @@ struct client_state {
     struct xkb_state *xkb_state;
     struct xkb_context *xkb_context;
     struct xkb_keymap *xkb_keymap;
+    struct touch_event touch_event;
 };
 
 /// --------- wl registry listener
@@ -465,6 +493,157 @@ static const struct wl_keyboard_listener wl_keyboard_listener = {
         .repeat_info = wl_keyboard_repeat_info,
 };
 
+/// --------- wl touch listener
+
+static struct touch_point *
+get_touch_point(struct client_state *client_state, int32_t id) {
+    struct touch_event *touch = &client_state->touch_event;
+    const size_t nmemb = sizeof(touch->points) / sizeof(struct touch_point);
+    int invalid = -1;
+    for (size_t i = 0; i < nmemb; ++i) {
+        if (touch->points[i].id == id) {
+            return &touch->points[i];
+        }
+        if (invalid == -1 && !touch->points[i].valid) {
+            invalid = i;
+        }
+    }
+    if (invalid == -1) {
+        return NULL;
+    }
+    touch->points[invalid].valid = true;
+    touch->points[invalid].id = id;
+    return &touch->points[invalid];
+}
+
+static void
+wl_touch_down(void *data, struct wl_touch *wl_touch, uint32_t serial,
+              uint32_t time, struct wl_surface *surface, int32_t id,
+              wl_fixed_t x, wl_fixed_t y) {
+    struct client_state *client_state = static_cast<struct client_state *>(data);
+    struct touch_point *point = get_touch_point(client_state, id);
+    if (point == NULL) {
+        return;
+    }
+    point->event_mask |= TOUCH_EVENT_UP;
+    point->surface_x = wl_fixed_to_double(x),
+            point->surface_y = wl_fixed_to_double(y);
+    client_state->touch_event.time = time;
+    client_state->touch_event.serial = serial;
+}
+
+static void
+wl_touch_up(void *data, struct wl_touch *wl_touch, uint32_t serial,
+            uint32_t time, int32_t id) {
+    struct client_state *client_state = static_cast<struct client_state *>(data);
+    struct touch_point *point = get_touch_point(client_state, id);
+    if (point == NULL) {
+        return;
+    }
+    point->event_mask |= TOUCH_EVENT_UP;
+}
+
+static void
+wl_touch_motion(void *data, struct wl_touch *wl_touch, uint32_t time,
+                int32_t id, wl_fixed_t x, wl_fixed_t y) {
+    struct client_state *client_state = static_cast<struct client_state *>(data);
+    struct touch_point *point = get_touch_point(client_state, id);
+    if (point == NULL) {
+        return;
+    }
+    point->event_mask |= TOUCH_EVENT_MOTION;
+    point->surface_x = x, point->surface_y = y;
+    client_state->touch_event.time = time;
+}
+
+static void
+wl_touch_cancel(void *data, struct wl_touch *wl_touch) {
+    struct client_state *client_state = static_cast<struct client_state *>(data);
+    client_state->touch_event.event_mask |= TOUCH_EVENT_CANCEL;
+}
+
+static void
+wl_touch_shape(void *data, struct wl_touch *wl_touch,
+               int32_t id, wl_fixed_t major, wl_fixed_t minor) {
+    struct client_state *client_state = static_cast<struct client_state *>(data);
+    struct touch_point *point = get_touch_point(client_state, id);
+    if (point == NULL) {
+        return;
+    }
+    point->event_mask |= TOUCH_EVENT_SHAPE;
+    point->major = major, point->minor = minor;
+}
+
+static void
+wl_touch_orientation(void *data, struct wl_touch *wl_touch,
+                     int32_t id, wl_fixed_t orientation) {
+    struct client_state *client_state = static_cast<struct client_state *>(data);
+    struct touch_point *point = get_touch_point(client_state, id);
+    if (point == NULL) {
+        return;
+    }
+    point->event_mask |= TOUCH_EVENT_ORIENTATION;
+    point->orientation = orientation;
+}
+
+
+static void
+wl_touch_frame(void *data, struct wl_touch *wl_touch) {
+    struct client_state *client_state = static_cast<struct client_state *>(data);
+    struct touch_event *touch = &client_state->touch_event;
+    const size_t nmemb = sizeof(touch->points) / sizeof(struct touch_point);
+    fprintf(stdout, "touch event @ %d:\n", touch->time);
+
+    for (size_t i = 0; i < nmemb; ++i) {
+        struct touch_point *point = &touch->points[i];
+        if (!point->valid) {
+            continue;
+        }
+        fprintf(stdout, "point %d: ", touch->points[i].id);
+
+        if (point->event_mask & TOUCH_EVENT_DOWN) {
+            fprintf(stdout, "down %f,%f ",
+                    wl_fixed_to_double(point->surface_x),
+                    wl_fixed_to_double(point->surface_y));
+        }
+
+        if (point->event_mask & TOUCH_EVENT_UP) {
+            fprintf(stdout, "up ");
+        }
+
+        if (point->event_mask & TOUCH_EVENT_MOTION) {
+            fprintf(stdout, "motion %f,%f ",
+                    wl_fixed_to_double(point->surface_x),
+                    wl_fixed_to_double(point->surface_y));
+        }
+
+        if (point->event_mask & TOUCH_EVENT_SHAPE) {
+            fprintf(stdout, "shape %fx%f ",
+                    wl_fixed_to_double(point->major),
+                    wl_fixed_to_double(point->minor));
+        }
+
+        if (point->event_mask & TOUCH_EVENT_ORIENTATION) {
+            fprintf(stdout, "orientation %f ",
+                    wl_fixed_to_double(point->orientation));
+        }
+
+        point->valid = false;
+        fprintf(stdout, "\n");
+    }
+}
+
+
+static const struct wl_touch_listener wl_touch_listener = {
+        .down = wl_touch_down,
+        .up = wl_touch_up,
+        .motion = wl_touch_motion,
+        .frame = wl_touch_frame,
+        .cancel = wl_touch_cancel,
+        .shape = wl_touch_shape,
+        .orientation = wl_touch_orientation,
+};
+
 /// --------- wl seat listener
 
 static void
@@ -491,6 +670,17 @@ wl_seat_capabilities(void *data, struct wl_seat *wl_seat, uint32_t capabilities)
     } else if (!have_keyboard && state->wl_keyboard != NULL) {
         wl_keyboard_release(state->wl_keyboard);
         state->wl_keyboard = NULL;
+    }
+
+    bool have_touch = capabilities & WL_SEAT_CAPABILITY_TOUCH;
+
+    if (have_touch && state->wl_touch == NULL) {
+        state->wl_touch = wl_seat_get_touch(state->wl_seat);
+        wl_touch_add_listener(state->wl_touch,
+                              &wl_touch_listener, state);
+    } else if (!have_touch && state->wl_touch != NULL) {
+        wl_touch_release(state->wl_touch);
+        state->wl_touch = NULL;
     }
 
 }
