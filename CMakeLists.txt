@@ -9,4 +9,4 @@ add_executable(pineNote_wayland_fastdraw
         shm_tools.h
         main.cpp
         )
-target_link_libraries(pineNote_wayland_fastdraw wayland-client)
+target_link_libraries(pineNote_wayland_fastdraw wayland-client xkbcommon)
