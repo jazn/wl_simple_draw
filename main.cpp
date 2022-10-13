@@ -4,6 +4,7 @@
 #include <wayland-client.h>
 #include <cstring>
 #include <xkbcommon/xkbcommon.h>
+#include <iostream>
 #include "shm_tools.h"
 #include "xdg-shell-client-protocol.h"
 
@@ -90,6 +91,8 @@ struct client_state {
     int width, height;
     bool closed;
     struct my_buffer my_buffer;
+    int x, y; // pinter last x and last y
+    bool button_pressed;
     struct pointer_event pointer_event;
     struct xkb_state *xkb_state;
     struct xkb_context *xkb_context;
@@ -293,13 +296,28 @@ draw_frame(struct client_state *state) {
         for (int x = 0; x < width; ++x) {
 //            if ((x + y / 8 * 8) % 16 < 8)
             if (((x + offset) + (y + offset) / 8 * 8) % 16 < 8)
-                my_buffer.data[y * width + x] = 0xFF666666;
+//                my_buffer.data[y * width + x] = 0xFF666666;
+                my_buffer.data[y * width + x] = 0xFFffffff;
             else
-                my_buffer.data[y * width + x] = 0xFFaaEEaa;
+//                my_buffer.data[y * width + x] = 0xFFaaEEaa;
+                my_buffer.data[y * width + x] = 0xFFffffff;
         }
     }
 
 }
+
+static void
+draw_point(struct client_state *state, int x, int y, uint32_t color) {
+    my_buffer& my_buffer = state->my_buffer;
+    int width = my_buffer.width, height = my_buffer.height;
+//    std::cout<<"point "<<x<<", "<<y<<std::endl;
+    for (int dy = 0; dy < 4; ++dy) {
+        for (int dx = 0; dx < 4; ++dx) {
+            my_buffer.data[(y+dy) * width + (x+dx)] = color;
+        }
+    }
+}
+
 
 static void
 xdg_toplevel_configure(void *data,
@@ -394,6 +412,8 @@ wl_pointer_enter(void *data, struct wl_pointer *wl_pointer,
     client_state->pointer_event.serial = serial;
     client_state->pointer_event.surface_x = surface_x,
             client_state->pointer_event.surface_y = surface_y;
+    client_state->x = wl_fixed_to_int(surface_x);
+    client_state->y = wl_fixed_to_int(surface_y);
 }
 
 static void
@@ -412,6 +432,21 @@ wl_pointer_motion(void *data, struct wl_pointer *wl_pointer, uint32_t time,
     client_state->pointer_event.time = time;
     client_state->pointer_event.surface_x = surface_x,
             client_state->pointer_event.surface_y = surface_y;
+    client_state->x = wl_fixed_to_int(surface_x);
+    client_state->y = wl_fixed_to_int(surface_y);
+
+    if(client_state->button_pressed) {
+        draw_point(client_state,
+                   client_state->x,
+                   client_state->y,
+                   0xFF00EE33
+        );
+        wl_surface_attach(client_state->wl_surface, client_state->my_buffer.wl_buffer, 0, 0);
+//	wl_surface_damage_buffer(state->wl_surface, 0, 0, INT32_MAX, INT32_MAX);
+        wl_surface_damage_buffer(client_state->wl_surface, client_state->x, client_state->y,
+                                 INT32_MAX, INT32_MAX);
+        wl_surface_commit(client_state->wl_surface);
+    }
 }
 
 static void
@@ -423,6 +458,21 @@ wl_pointer_button(void *data, struct wl_pointer *wl_pointer, uint32_t serial,
     client_state->pointer_event.serial = serial;
     client_state->pointer_event.button = button,
             client_state->pointer_event.state = state;
+
+    client_state->button_pressed = state == WL_POINTER_BUTTON_STATE_RELEASED ? false : true;
+
+    draw_point(client_state,
+               client_state->x,
+               client_state->y,
+               0xFF00EE33
+               );
+    wl_surface_attach(client_state->wl_surface, client_state->my_buffer.wl_buffer, 0, 0);
+//	wl_surface_damage_buffer(state->wl_surface, 0, 0, INT32_MAX, INT32_MAX);
+    wl_surface_damage_buffer(client_state->wl_surface, client_state->x, client_state->y,
+                             INT32_MAX, INT32_MAX);
+    wl_surface_commit(client_state->wl_surface);
+
+
 }
 
 static void
@@ -887,7 +937,7 @@ main(int argc, char *argv[]) {
     xdg_toplevel_set_title(state.xdg_toplevel, "Example client");
     wl_surface_commit(state.wl_surface);
 
-    struct wl_callback *cb = wl_surface_frame(state.wl_surface);
+//    struct wl_callback *cb = wl_surface_frame(state.wl_surface);
 //    wl_callback_add_listener(cb, &wl_surface_frame_listener, &state);
 
 
