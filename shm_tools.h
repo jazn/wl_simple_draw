@@ -10,20 +10,24 @@
 #include <unistd.h>
 
 static void
-randname(char *buf)
-{
+randname(char *buf) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     long r = ts.tv_nsec;
     for (int i = 0; i < 6; ++i) {
-        buf[i] = 'A'+(r&15)+(r&16)*2;
+        buf[i] = 'A' + (r & 15) + (r & 16) * 2;
         r >>= 5;
     }
 }
 
 static int
-create_shm_file(void)
-{
+create_shm_file(void) {
+    const char *path = getenv("XDG_RUNTIME_DIR");
+    if (!path) {
+        errno = ENOENT;
+        return -1;
+    }
+
     int retries = 100;
     do {
         char name[] = "/wl_shm-XXXXXX";
@@ -39,8 +43,7 @@ create_shm_file(void)
 }
 
 int
-allocate_shm_file(size_t size)
-{
+allocate_shm_file(size_t size) {
     int fd = create_shm_file();
     if (fd < 0)
         return -1;
