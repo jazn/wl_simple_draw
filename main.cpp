@@ -63,6 +63,12 @@ struct pointer_event {
 
 /// --------- client state
 
+struct my_buffer {
+    int width, height;
+    uint32_t *data;
+    struct wl_buffer *wl_buffer;
+};
+
 struct client_state {
     /* Globals */
     struct wl_display *wl_display;
@@ -83,6 +89,7 @@ struct client_state {
     uint32_t last_frame;
     int width, height;
     bool closed;
+    struct my_buffer my_buffer;
     struct pointer_event pointer_event;
     struct xkb_state *xkb_state;
     struct xkb_context *xkb_context;
@@ -90,12 +97,104 @@ struct client_state {
     struct touch_event touch_event;
 };
 
+
+/// --------- other shm tool
+
+static int
+set_cloexec_or_close(int fd) {
+    long flags;
+
+    if (fd == -1)
+        return -1;
+
+    flags = fcntl(fd, F_GETFD);
+    if (flags == -1)
+        goto err;
+
+    if (fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == -1)
+        goto err;
+
+    return fd;
+
+    err:
+    close(fd);
+    return -1;
+}
+
+static int
+create_tmpfile_cloexec(char *tmpname) {
+    int fd;
+
+#ifdef HAVE_MKOSTEMP
+    fd = mkostemp(tmpname, O_CLOEXEC);
+        if (fd >= 0)
+                unlink(tmpname);
+#else
+    fd = mkstemp(tmpname);
+    if (fd >= 0) {
+        fd = set_cloexec_or_close(fd);
+        unlink(tmpname);
+    }
+#endif
+
+    return fd;
+}
+
+/*
+ * Create a new, unique, anonymous file of the given size, and
+ * return the file descriptor for it. The file descriptor is set
+ * CLOEXEC. The file is immediately suitable for mmap()'ing
+ * the given size at offset zero.
+ *
+ * The file should not have a permanent backing store like a disk,
+ * but may have if XDG_RUNTIME_DIR is not properly implemented in OS.
+ *
+ * The file name is deleted from the file system.
+ *
+ * The file is suitable for buffer sharing between processes by
+ * transmitting the file descriptor over Unix sockets using the
+ * SCM_RIGHTS methods.
+ */
+int
+os_create_anonymous_file(off_t size) {
+    static const char template1[] = "/weston-shared-XXXXXX";
+    const char *path;
+    char *name;
+    int fd;
+
+    path = getenv("XDG_RUNTIME_DIR");
+    if (!path) {
+        errno = ENOENT;
+        return -1;
+    }
+
+    name = static_cast<char *>(malloc(strlen(path) + sizeof(template1)));
+    if (!name)
+        return -1;
+    strcpy(name, path);
+    strcat(name,
+           template1);
+
+    fd = create_tmpfile_cloexec(name);
+
+    free(name);
+
+    if (fd < 0)
+        return -1;
+
+    if (ftruncate(fd, size) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    return fd;
+}
+
 /// --------- wl registry listener
 
 static void
 registry_handle_global(void *data, struct wl_registry *wl_registry,
-                       uint32_t name, const char *interface, uint32_t version)
-{
+                       uint32_t name, const char *interface, uint32_t version) {
     printf("interface: '%s', version: %d, name: %d\n",
            interface, version, name);
 
@@ -103,12 +202,10 @@ registry_handle_global(void *data, struct wl_registry *wl_registry,
     if (strcmp(interface, wl_compositor_interface.name) == 0) {
         state->wl_compositor = static_cast<wl_compositor *>(wl_registry_bind(
                 wl_registry, name, &wl_compositor_interface, 5));
-    }
-    if (strcmp(interface, wl_shm_interface.name) == 0) {
+    } else if (strcmp(interface, wl_shm_interface.name) == 0) {
         state->wl_shm = static_cast<wl_shm *>(wl_registry_bind(
                 wl_registry, name, &wl_shm_interface, 1));
-    }
-    if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
+    } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
         state->xdg_wm_base = static_cast<xdg_wm_base *>(wl_registry_bind(
                 wl_registry, name, &xdg_wm_base_interface, 1));
     } else if (strcmp(interface, wl_seat_interface.name) == 0) {
@@ -119,8 +216,7 @@ registry_handle_global(void *data, struct wl_registry *wl_registry,
 
 static void
 registry_handle_global_remove(void *data, struct wl_registry *registry,
-                              uint32_t name)
-{
+                              uint32_t name) {
     // This space deliberately left blank
 }
 
@@ -133,8 +229,7 @@ static const struct wl_registry_listener
 /// --------- wl buffer listener
 
 static void
-wl_buffer_release(void *data, struct wl_buffer *wl_buffer)
-{
+wl_buffer_release(void *data, struct wl_buffer *wl_buffer) {
     /* Sent by the compositor when it's no longer using this buffer */
     wl_buffer_destroy(wl_buffer);
 }
@@ -146,9 +241,8 @@ static const struct wl_buffer_listener wl_buffer_listener = {
 /// --------- xdg surface listener
 
 static struct wl_buffer *
-draw_frame(struct client_state *state)
-{
-    const int width = 640, height = 480;
+        create_buffer(struct client_state *state) {
+    int width = state->width, height = state->height;
     int stride = width * 4;
     int size = stride * height;
 
@@ -157,44 +251,94 @@ draw_frame(struct client_state *state)
         return NULL;
     }
 
-    uint32_t *data = static_cast<uint32_t *>(mmap(NULL, size,
+    state->my_buffer.data = static_cast<uint32_t *>(mmap(NULL, size,
                                                   PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
-    if (data == MAP_FAILED) {
+    if (state->my_buffer.data == MAP_FAILED) {
         close(fd);
+        state->my_buffer.wl_buffer = nullptr;
         return NULL;
     }
+    state->my_buffer.width = width;
+    state->my_buffer.height = height;
 
     struct wl_shm_pool *pool = wl_shm_create_pool(state->wl_shm, fd, size);
-    struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0,
+    state->my_buffer.wl_buffer = wl_shm_pool_create_buffer(pool, 0,
                                                          width, height, stride, WL_SHM_FORMAT_XRGB8888);
     wl_shm_pool_destroy(pool);
     close(fd);
 
+    return state->my_buffer.wl_buffer;
+}
+static void
+unmap_buffer(struct client_state *state) {
+    my_buffer& my_buffer = state->my_buffer;
+    int width = my_buffer.width, height = my_buffer.height;
+    int stride = width * 4;
+    int size = stride * height;
+
+    munmap(my_buffer.data, size);
+    wl_buffer_add_listener(my_buffer.wl_buffer, &wl_buffer_listener, NULL);
+}
+
+//static struct wl_buffer *
+static void
+draw_frame(struct client_state *state) {
+
+    my_buffer& my_buffer = state->my_buffer;
+    int width = my_buffer.width, height = my_buffer.height;
+
     /* Draw checkerboxed background */
-    int offset = (int)state->offset % 8;
+    int offset = (int) state->offset % 8;
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
 //            if ((x + y / 8 * 8) % 16 < 8)
-        	if (((x + offset) + (y + offset) / 8 * 8) % 16 < 8)
-                    data[y * width + x] = 0xFF666666;
+            if (((x + offset) + (y + offset) / 8 * 8) % 16 < 8)
+                my_buffer.data[y * width + x] = 0xFF666666;
             else
-                data[y * width + x] = 0xFFaaEEaa;
+                my_buffer.data[y * width + x] = 0xFFaaEEaa;
         }
     }
 
-    munmap(data, size);
-    wl_buffer_add_listener(buffer, &wl_buffer_listener, NULL);
-    return buffer;
 }
 
 static void
+xdg_toplevel_configure(void *data,
+                       struct xdg_toplevel *xdg_toplevel, int32_t width, int32_t height,
+                       struct wl_array *states) {
+    struct client_state *state = static_cast<client_state *>(data);
+    if (width == 0 || height == 0) {
+        /* Compositor is deferring to us */
+        return;
+    }
+    state->width = width;
+    state->height = height;
+}
+
+static void
+xdg_toplevel_close(void *data, struct xdg_toplevel *toplevel) {
+    struct client_state *state = static_cast<client_state *>(data);
+    unmap_buffer(state);
+    state->closed = true;
+}
+
+static const struct xdg_toplevel_listener xdg_toplevel_listener = {
+        .configure = xdg_toplevel_configure,
+        .close = xdg_toplevel_close,
+};
+
+static void
 xdg_surface_configure(void *data,
-                      struct xdg_surface *xdg_surface, uint32_t serial)
-{
+                      struct xdg_surface *xdg_surface, uint32_t serial) {
     struct client_state *state = static_cast<client_state *>(data);
     xdg_surface_ack_configure(xdg_surface, serial);
 
-    struct wl_buffer *buffer = draw_frame(state);
+    struct wl_buffer *buffer = create_buffer(state);
+    if (! buffer) {
+        return;
+    }
+//    struct wl_buffer *buffer =
+    draw_frame(state);
+
     wl_surface_attach(state->wl_surface, buffer, 0, 0);
     wl_surface_commit(state->wl_surface);
 }
@@ -208,34 +352,34 @@ static const struct xdg_surface_listener xdg_surface_listener = {
 extern /*static*/ const struct wl_callback_listener wl_surface_frame_listener;
 
 static void
-wl_surface_frame_done(void *data, struct wl_callback *cb, uint32_t time)
-{
-	/* Destroy this callback */
-	wl_callback_destroy(cb);
+wl_surface_frame_done(void *data, struct wl_callback *cb, uint32_t time) {
+    /* Destroy this callback */
+    wl_callback_destroy(cb);
 
-	/* Request another frame */
-	struct client_state *state = static_cast<client_state *>(data);
-	cb = wl_surface_frame(state->wl_surface);
-	wl_callback_add_listener(cb, &wl_surface_frame_listener, state);
+    /* Request another frame */
+    struct client_state *state = static_cast<client_state *>(data);
+    cb = wl_surface_frame(state->wl_surface);
+    wl_callback_add_listener(cb, &wl_surface_frame_listener, state);
 
-	/* Update scroll amount at 24 pixels per second */
-	if (state->last_frame != 0) {
-		int elapsed = time - state->last_frame;
-		state->offset += elapsed / 1000.0 * 24;
-	}
+    /* Update scroll amount at 24 pixels per second */
+    if (state->last_frame != 0) {
+        int elapsed = time - state->last_frame;
+        state->offset += elapsed / 1000.0 * 24;
+    }
 
-	/* Submit a frame for this event */
-	struct wl_buffer *buffer = draw_frame(state);
-	wl_surface_attach(state->wl_surface, buffer, 0, 0);
+    /* Submit a frame for this event */
+//    struct wl_buffer *buffer =
+    draw_frame(state);
+    wl_surface_attach(state->wl_surface, state->my_buffer.wl_buffer, 0, 0);
 //	wl_surface_damage_buffer(state->wl_surface, 0, 0, INT32_MAX, INT32_MAX);
-	wl_surface_damage_buffer(state->wl_surface, 0, 0, 20, INT32_MAX);
-	wl_surface_commit(state->wl_surface);
+    wl_surface_damage_buffer(state->wl_surface, 0, 0, 20, INT32_MAX);
+    wl_surface_commit(state->wl_surface);
 
-	state->last_frame = time;
+    state->last_frame = time;
 }
 
 /*static*/ const struct wl_callback_listener wl_surface_frame_listener = {
-	.done = wl_surface_frame_done,
+        .done = wl_surface_frame_done,
 };
 
 
@@ -695,14 +839,26 @@ static const struct wl_seat_listener wl_seat_listener = {
         .name = wl_seat_name,
 };
 
+/// --------- xdg wm base listener
 
+static void
+xdg_wm_base_ping(void *data,
+                 struct xdg_wm_base *xdg_wm_base,
+                 uint32_t serial) {
+    xdg_wm_base_pong(xdg_wm_base, serial);
+}
+
+static const struct xdg_wm_base_listener xdg_wm_base_listener = {
+        .ping  = xdg_wm_base_ping
+};
 
 /// --------- main
 
 int
-main(int argc, char *argv[])
-{
-    struct client_state state = {0 };
+main(int argc, char *argv[]) {
+    struct client_state state = {0};
+    state.width = 640;
+    state.height = 480;
 
     /// connect display
     state.wl_display = wl_display_connect(NULL);
@@ -712,6 +868,7 @@ main(int argc, char *argv[])
 //    wl_shm_add_listener(registry, &registry_listener, &state);
     wl_display_roundtrip(state.wl_display);
 
+    xdg_wm_base_add_listener(state.xdg_wm_base, &xdg_wm_base_listener, &state);
     wl_seat_add_listener(state.wl_seat, &wl_seat_listener, &state);
 
     /// create surface
@@ -725,19 +882,23 @@ main(int argc, char *argv[])
 
     /// get toplevel
     state.xdg_toplevel = xdg_surface_get_toplevel(state.xdg_surface);
+    xdg_toplevel_add_listener(state.xdg_toplevel,
+                              +&xdg_toplevel_listener, &state);
     xdg_toplevel_set_title(state.xdg_toplevel, "Example client");
     wl_surface_commit(state.wl_surface);
 
     struct wl_callback *cb = wl_surface_frame(state.wl_surface);
-    wl_callback_add_listener(cb, &wl_surface_frame_listener, &state);
+//    wl_callback_add_listener(cb, &wl_surface_frame_listener, &state);
 
 
 
 
     /// dispatch loop
-    while (wl_display_dispatch(state.wl_display)) {
+    while (!state.closed && wl_display_dispatch(state.wl_display)) {
         /* This space deliberately left blank */
     }
+
+    /// TODO destory/free resources
 
     return 0;
 }
